@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "照片生成器",
+    "slug": "photo-generator",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#ffffff"
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "0c9c8e9f-2edf-4e8c-ac6f-0a5b1d89c97a"
+      }
+    }
+  }
+}
