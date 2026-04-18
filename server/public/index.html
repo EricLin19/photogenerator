@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>上传照片</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f0f2f5; }
+        .card { background: white; padding: 2rem; border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 80%; max-width: 400px; text-align: center; }
+        input[type="file"] { display: none; }
+        .upload-btn { background: #007bff; color: white; padding: 1rem 2rem; border-radius: 0.5rem; cursor: pointer; display: inline-block; margin-top: 1rem; font-weight: bold; }
+        #preview { width: 100%; margin-top: 1rem; border-radius: 0.5rem; display: none; }
+        .status { margin-top: 1rem; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>上传您的照片</h2>
+        <p>选一张照片发送到 APP</p>
+        <label for="fileInput" class="upload-btn">选择照片</label>
+        <input type="file" id="fileInput" accept="image/*">
+        <img id="preview">
+        <div id="status" class="status"></div>
+    </div>
+
+    <script>
+        const fileInput = document.getElementById('fileInput');
+        const status = document.getElementById('status');
+        const preview = document.getElementById('preview');
+
+        // 从 URL 获取设备 ID
+        const urlParams = new URLSearchParams(window.location.search);
+        const deviceId = urlParams.get('deviceId') || 'default_device';
+
+        fileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            // 显示预览
+            preview.src = URL.createObjectURL(file);
+            preview.style.display = 'block';
+            status.innerText = '正在上传...';
+
+            const formData = new FormData();
+            formData.append('photo', file);
+            formData.append('deviceId', deviceId);
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                if (result.success) {
+                    status.innerText = '上传成功！请回到 APP 查看。';
+                    status.style.color = 'green';
+                }
+            } catch (err) {
+                status.innerText = '上传失败，请重试。';
+                status.style.color = 'red';
+            }
+        });
+    </script>
+</body>
+</html>
