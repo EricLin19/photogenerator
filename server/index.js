@@ -27,8 +27,9 @@ const uploadsPath = path.join(__dirname, 'uploads');
 app.use(express.static(publicPath));
 app.use('/uploads', express.static(uploadsPath));
 
-// 火山引擎 (CV 视觉智能) 配置 - 对应文档: https://www.volcengine.com/docs/86081/1660199
-const CV_ENDPOINT = 'https://visual.volcengineapi.com?Action=CVProcess&Version=2022-08-31';
+// 火山引擎 (即梦AI 4.6) 配置
+const VOLC_API_HOST = 'https://visual.volcengineapi.com';
+const JIMENG_REQ_KEY = 'jimeng_seedream46_cvtob';
 
 // 注意：CV 接口通常需要 AK/SK 签名，如果您有 Access Key 和 Secret Key，请在这里填写
 const VOLC_AK = process.env.VOLC_AK || '';
@@ -84,7 +85,49 @@ function sign(options) {
   headers['Authorization'] = `HMAC-SHA256 Credential=${ak}/${date}/${region}/${service}/request, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 }
 
-// AI 生成接口 (切换到图像风格化 CV 专用接口)
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function promptByStyle(style) {
+  if (style === 'ink') {
+    return '中国水墨风格，保留人物五官、姿态和场景构图，整体弱风格化，尽量保持背景一致。';
+  }
+  // 默认网红日漫风格
+  return '网红日漫写真风格，保留人物五官、姿态和场景构图，整体弱风格化，尽量保持背景一致。';
+}
+
+async function requestVolcCv(action, payload, timeout = 45000) {
+  const query = {
+    Action: action,
+    Version: '2022-08-31'
+  };
+  const headers = {
+    'Content-Type': 'application/json'
+  };
+  const bodyString = JSON.stringify(payload);
+
+  sign({
+    method: 'POST',
+    path: '/',
+    query,
+    headers,
+    bodyString,
+    ak: VOLC_AK,
+    sk: VOLC_SK,
+    region: 'cn-north-1',
+    service: 'cv'
+  });
+
+  const resp = await axios.post(
+    `${VOLC_API_HOST}?Action=${action}&Version=2022-08-31`,
+    bodyString,
+    { headers, timeout }
+  );
+  return resp.data;
+}
+
+// AI 生成接口 (即梦AI4.6: 提交任务 + 轮询结果)
 app.post('/ai-generate', async (req, res) => {
   const { style, photoUri, base64Image: clientBase64 } = req.body;
   try {
@@ -95,94 +138,89 @@ app.post('/ai-generate', async (req, res) => {
       });
     }
 
-    let base64Image = clientBase64;
+    let imageUrl = '';
 
-    if (!base64Image && photoUri) {
-      const fileName = path.basename(decodeURIComponent(photoUri));
-      const filePath = path.join(__dirname, 'uploads', fileName);
-      if (fs.existsSync(filePath)) {
-        const imageBuffer = fs.readFileSync(filePath);
-        base64Image = imageBuffer.toString('base64');
-      }
+    // 优先使用已经是公网可访问的 URL（扫码上传后的常见场景）
+    if (photoUri && photoUri.startsWith('http')) {
+      imageUrl = photoUri;
     }
 
-    if (!base64Image) {
+    // 如果客户端传的是 base64（本地相册选择），临时保存到 uploads 再转成 URL
+    if (!imageUrl && clientBase64) {
+      const fileName = `${Date.now()}_input.jpg`;
+      const filePath = path.join(__dirname, 'uploads', fileName);
+      fs.writeFileSync(filePath, Buffer.from(clientBase64, 'base64'));
+
+      const proto = req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http');
+      imageUrl = `${proto}://${req.headers.host}/uploads/${fileName}`;
+    }
+
+    if (!imageUrl) {
       return res.status(400).json({ success: false, message: "未找到上传的照片" });
     }
 
-    // 依照您的要求，重新命名风格并配置 req_key 和 sub_req_key
-    let reqKey = "";
-    let subReqKey = "";
+    const prompt = promptByStyle(style);
+    console.log(`提交即梦4.6任务: style=${style || 'default'}, imageUrl=${imageUrl}`);
 
-    if (style === 'ghibli') {
-      // 网红日漫风格
-      reqKey = "img2img_ghibli_style_usage";
-    } else if (style === 'ink') {
-      // 水墨风
-      reqKey = "img2img_water_ink_style_usage";
-    }
-
-    console.log(`正在请求火山弱滤镜风格化 (CVProcess): 风格: ${style}, reqKey: ${reqKey}${subReqKey ? ', subReqKey: ' + subReqKey : ''}`);
-    
-    // 弱滤镜模式 Payload
-    const payload = {
-      req_key: reqKey,
-      binary_data_base64: [base64Image], 
-      denoising_strength: 0.1, 
-      return_url: true,
-      logo_info: { add_logo: false }
+    // 1) 提交任务
+    const submitPayload = {
+      req_key: JIMENG_REQ_KEY,
+      image_urls: [imageUrl],
+      prompt,
+      force_single: true
     };
-
-    // 如果有 sub_req_key，则加入 payload
-    if (subReqKey) {
-      payload.sub_req_key = subReqKey;
-    }
-
-    const bodyString = JSON.stringify(payload);
-
-    const query = {
-      Action: 'CVProcess',
-      Version: '2022-08-31'
-    };
-
-    const headers = {
-      'Content-Type': 'application/json'
-    };
-
-    // 执行 V4 签名
-    sign({
-      method: 'POST',
-      path: '/',
-      query: query,
-      headers: headers,
-      bodyString: bodyString,
-      ak: VOLC_AK,
-      sk: VOLC_SK,
-      region: 'cn-north-1',
-      service: 'cv'
-    });
-
-    const response = await axios.post(
-      `https://visual.volcengineapi.com?Action=CVProcess&Version=2022-08-31`,
-      bodyString, // 必须使用签名时完全一致的字符串
-      {
-        headers: headers,
-        timeout: 45000 
-      }
-    );
-    
-    // CV 接口返回结构适配
-    if (response.data && response.data.data && response.data.data.image_urls && response.data.data.image_urls[0]) {
-      console.log("AI 风格化成功！");
-      res.json({ success: true, url: response.data.data.image_urls[0] });
-    } else {
-      console.error("火山返回原始数据:", JSON.stringify(response.data));
-      res.status(500).json({ 
-        success: false, 
-        message: response.data.message || "火山引擎未返回有效的图片链接",
-        raw: response.data 
+    const submitData = await requestVolcCv('CVSync2AsyncSubmitTask', submitPayload, 45000);
+    const taskId = submitData?.data?.task_id;
+    if (submitData?.code !== 10000 || !taskId) {
+      console.error("即梦提交任务失败:", JSON.stringify(submitData));
+      return res.status(500).json({
+        success: false,
+        message: submitData?.message || "即梦任务提交失败",
+        raw: submitData
       });
     }
+
+    // 2) 轮询结果
+    const maxPollCount = 30; // 约 60 秒
+    for (let i = 0; i < maxPollCount; i++) {
+      const pollPayload = {
+        req_key: JIMENG_REQ_KEY,
+        task_id: taskId,
+        req_json: JSON.stringify({ return_url: true })
+      };
+      const pollData = await requestVolcCv('CVSync2AsyncGetResult', pollPayload, 30000);
+      const status = pollData?.data?.status;
+      const imageUrlResult = pollData?.data?.image_urls?.[0];
+
+      if (status === 'done') {
+        if (pollData?.code === 10000 && imageUrlResult) {
+          console.log("即梦4.6生成成功！");
+          return res.json({ success: true, url: imageUrlResult });
+        }
+        console.error("即梦任务完成但失败:", JSON.stringify(pollData));
+        return res.status(500).json({
+          success: false,
+          message: pollData?.message || "即梦任务处理失败",
+          raw: pollData
+        });
+      }
+
+      if (status === 'expired' || status === 'not_found') {
+        console.error("即梦任务状态异常:", JSON.stringify(pollData));
+        return res.status(500).json({
+          success: false,
+          message: `即梦任务状态异常: ${status}`,
+          raw: pollData
+        });
+      }
+
+      await sleep(2000);
+    }
+
+    return res.status(504).json({
+      success: false,
+      message: "即梦任务超时，请重试"
+    });
   } catch (error) {
     const errorData = error.response?.data;
     console.error("风格化失败详情:", JSON.stringify(errorData) || error.message);
@@ -214,7 +252,8 @@ const upload = multer({ storage });
 
 app.post('/upload', upload.single('photo'), (req, res) => {
   if (req.file) {
-    const photoUrl = `http://${req.headers.host}/uploads/${req.file.filename}`;
+    const proto = req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http');
+    const photoUrl = `${proto}://${req.headers.host}/uploads/${req.file.filename}`;
     const deviceId = req.body.deviceId;
     console.log(`收到图片: ${photoUrl}, 发送给设备: ${deviceId}`);
     io.emit(`upload_success_${deviceId}`, { photoUrl, photoId: Math.floor(Math.random() * 10000).toString().padStart(4, '0') });
