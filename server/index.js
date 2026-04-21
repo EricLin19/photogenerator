@@ -93,8 +93,8 @@ function promptByStyle(style) {
   if (style === 'ink') {
     return '中国水墨风格，保留人物五官、姿态和场景构图，整体弱风格化，尽量保持背景一致。';
   }
-  // 默认网红日漫风格
-  return '网红日漫写真风格，保留人物五官、姿态和场景构图，整体弱风格化，尽量保持背景一致。';
+  // 默认：宫崎骏吉卜力动漫风格
+  return '生成宫崎骏吉卜力动漫风格的照片，按照我给你的图片1:1还原场景。';
 }
 
 async function requestVolcCv(action, payload, timeout = 45000) {
