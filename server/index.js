@@ -23,6 +23,8 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // 使用绝对路径，确保无论从哪里启动服务器都能找到静态文件
 const publicPath = path.join(__dirname, 'public');
 const uploadsPath = path.join(__dirname, 'uploads');
+const dataPath = path.join(__dirname, 'data');
+const sequenceStatePath = path.join(dataPath, 'sequence.json');
 
 app.use(express.static(publicPath));
 app.use('/uploads', express.static(uploadsPath));
@@ -89,6 +91,104 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function ensureDirSync(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+}
+
+ensureDirSync(uploadsPath);
+
+function normalizePrefix(prefix) {
+  const raw = String(prefix || '').trim().toUpperCase();
+  if (!raw) return null;
+  if (!/^[A-Z]{1,4}$/.test(raw)) return null;
+  return raw;
+}
+
+function readSequenceStateSync() {
+  ensureDirSync(dataPath);
+  if (!fs.existsSync(sequenceStatePath)) {
+    return { prefix: 'TEST', nextNumber: 1 };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(sequenceStatePath, 'utf8'));
+    const prefix = normalizePrefix(parsed?.prefix) || 'TEST';
+    const nextNumber = Number.isFinite(parsed?.nextNumber) ? Math.max(1, Math.floor(parsed.nextNumber)) : 1;
+    return { prefix, nextNumber };
+  } catch {
+    return { prefix: 'TEST', nextNumber: 1 };
+  }
+}
+
+function writeSequenceStateSync(state) {
+  ensureDirSync(dataPath);
+  fs.writeFileSync(sequenceStatePath, JSON.stringify(state, null, 2), 'utf8');
+}
+
+let sequenceLock = Promise.resolve();
+function withSequenceLock(fn) {
+  const next = sequenceLock.then(fn, fn);
+  sequenceLock = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+async function allocateNextPhotoCode() {
+  return withSequenceLock(async () => {
+    const state = readSequenceStateSync();
+    const envPrefix = normalizePrefix(process.env.PHOTO_PREFIX);
+    const prefix = envPrefix || state.prefix || 'TEST';
+    const current = state.nextNumber || 1;
+    const nextState = { prefix, nextNumber: current + 1 };
+    writeSequenceStateSync(nextState);
+    return `${prefix}-${current}`;
+  });
+}
+
+function parsePhotoCodeFromUrl(photoUrl) {
+  try {
+    const urlObj = new URL(photoUrl);
+    const baseName = path.basename(urlObj.pathname, path.extname(urlObj.pathname));
+    if (/^[A-Z]{1,4}-\d+$/.test(baseName)) return baseName;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function guessFileExtFromContentType(contentType, fallbackExt) {
+  const ct = String(contentType || '').toLowerCase();
+  if (ct.includes('image/jpeg')) return '.jpg';
+  if (ct.includes('image/jpg')) return '.jpg';
+  if (ct.includes('image/png')) return '.png';
+  if (ct.includes('image/webp')) return '.webp';
+  return fallbackExt || '.jpg';
+}
+
+async function getNextGeneratedIndex(prefix, photoCode) {
+  const dir = path.join(uploadsPath, prefix);
+  ensureDirSync(dir);
+  const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  let maxIndex = 0;
+  const needle = `${photoCode}.`;
+  for (const e of entries) {
+    if (!e.isFile()) continue;
+    if (!e.name.startsWith(needle)) continue;
+    const rest = e.name.slice(needle.length);
+    const dotIdx = rest.indexOf('.');
+    const numStr = dotIdx === -1 ? rest : rest.slice(0, dotIdx);
+    const num = Number.parseInt(numStr, 10);
+    if (Number.isFinite(num) && num > maxIndex) maxIndex = num;
+  }
+  return maxIndex + 1;
+}
+
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+function isAdminAllowed(req) {
+  if (!ADMIN_KEY) return true;
+  return String(req.headers['x-admin-key'] || '') === ADMIN_KEY;
+}
+
 function promptByStyle(style) {
   if (style === 'ink') {
     return '中国水墨风格，保留人物五官、姿态和场景构图，整体弱风格化，尽量保持背景一致。';
@@ -127,6 +227,23 @@ async function requestVolcCv(action, payload, timeout = 45000) {
   return resp.data;
 }
 
+app.get('/admin/sequence', (req, res) => {
+  if (!isAdminAllowed(req)) return res.status(403).json({ success: false, message: 'Forbidden' });
+  const state = readSequenceStateSync();
+  const envPrefix = normalizePrefix(process.env.PHOTO_PREFIX);
+  res.json({ success: true, prefix: envPrefix || state.prefix, nextNumber: state.nextNumber });
+});
+
+app.post('/admin/sequence/reset', async (req, res) => {
+  if (!isAdminAllowed(req)) return res.status(403).json({ success: false, message: 'Forbidden' });
+  const requestedPrefix = normalizePrefix(req.body?.prefix);
+  const prefix = requestedPrefix || normalizePrefix(process.env.PHOTO_PREFIX) || readSequenceStateSync().prefix || 'TEST';
+  await withSequenceLock(async () => {
+    writeSequenceStateSync({ prefix, nextNumber: 1 });
+  });
+  res.json({ success: true, prefix, nextNumber: 1 });
+});
+
 // AI 生成接口 (即梦AI4.6: 提交任务 + 轮询结果)
 app.post('/ai-generate', async (req, res) => {
   const { style, photoUri, base64Image: clientBase64 } = req.body;
@@ -139,20 +256,26 @@ app.post('/ai-generate', async (req, res) => {
     }
 
     let imageUrl = '';
+    let photoCode = null;
 
     // 优先使用已经是公网可访问的 URL（扫码上传后的常见场景）
     if (photoUri && photoUri.startsWith('http')) {
       imageUrl = photoUri;
+      photoCode = parsePhotoCodeFromUrl(photoUri);
     }
 
     // 如果客户端传的是 base64（本地相册选择），临时保存到 uploads 再转成 URL
     if (!imageUrl && clientBase64) {
-      const fileName = `${Date.now()}_input.jpg`;
-      const filePath = path.join(__dirname, 'uploads', fileName);
+      photoCode = await allocateNextPhotoCode();
+      const prefix = photoCode.split('-')[0];
+      const prefixDir = path.join(uploadsPath, prefix);
+      ensureDirSync(prefixDir);
+      const fileName = `${photoCode}.jpg`;
+      const filePath = path.join(prefixDir, fileName);
       fs.writeFileSync(filePath, Buffer.from(clientBase64, 'base64'));
 
       const proto = req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http');
-      imageUrl = `${proto}://${req.headers.host}/uploads/${fileName}`;
+      imageUrl = `${proto}://${req.headers.host}/uploads/${prefix}/${fileName}`;
     }
 
     if (!imageUrl) {
@@ -194,8 +317,31 @@ app.post('/ai-generate', async (req, res) => {
 
       if (status === 'done') {
         if (pollData?.code === 10000 && imageUrlResult) {
-          console.log("即梦4.6生成成功！");
-          return res.json({ success: true, url: imageUrlResult });
+          const proto = req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http');
+
+          if (!photoCode) {
+            photoCode = await allocateNextPhotoCode();
+          }
+
+          const prefix = photoCode.split('-')[0];
+          const prefixDir = path.join(uploadsPath, prefix);
+          ensureDirSync(prefixDir);
+          const nextIndex = await getNextGeneratedIndex(prefix, photoCode);
+
+          try {
+            const imgResp = await axios.get(imageUrlResult, { responseType: 'arraybuffer', timeout: 45000 });
+            const fallbackExt = path.extname(new URL(imageUrlResult).pathname) || '.jpg';
+            const ext = guessFileExtFromContentType(imgResp.headers?.['content-type'], fallbackExt);
+            const outName = `${photoCode}.${nextIndex}${ext}`;
+            const outPath = path.join(prefixDir, outName);
+            fs.writeFileSync(outPath, Buffer.from(imgResp.data));
+            const localUrl = `${proto}://${req.headers.host}/uploads/${prefix}/${outName}`;
+            console.log(`即梦4.6生成成功，已落盘: ${outName}`);
+            return res.json({ success: true, url: localUrl, remoteUrl: imageUrlResult, photoId: photoCode, generatedIndex: nextIndex });
+          } catch (downloadErr) {
+            console.log("即梦4.6生成成功，但下载落盘失败，回退到远端URL:", downloadErr.message);
+            return res.json({ success: true, url: imageUrlResult, photoId: photoCode });
+          }
         }
         console.error("即梦任务完成但失败:", JSON.stringify(pollData));
         return res.status(500).json({
@@ -243,21 +389,40 @@ app.post('/ai-generate', async (req, res) => {
 });
 
 const storage = multer.diskStorage({
-  destination: 'server/uploads/',
+  destination: (req, file, cb) => {
+    ensureDirSync(uploadsPath);
+    cb(null, uploadsPath);
+  },
   filename: (req, file, cb) => {
     cb(null, Date.now() + path.extname(file.originalname));
   }
 });
 const upload = multer({ storage });
 
-app.post('/upload', upload.single('photo'), (req, res) => {
+app.post('/upload', upload.single('photo'), async (req, res) => {
   if (req.file) {
     const proto = req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http');
-    const photoUrl = `${proto}://${req.headers.host}/uploads/${req.file.filename}`;
+    const photoCode = await allocateNextPhotoCode();
+    const prefix = photoCode.split('-')[0];
+    const prefixDir = path.join(uploadsPath, prefix);
+    ensureDirSync(prefixDir);
+
+    const ext = path.extname(req.file.originalname) || path.extname(req.file.filename) || '.jpg';
+    const finalName = `${photoCode}${ext}`;
+    const tempPath = req.file.path || path.join(uploadsPath, req.file.filename);
+    const finalPath = path.join(prefixDir, finalName);
+    try {
+      fs.renameSync(tempPath, finalPath);
+    } catch {
+      fs.copyFileSync(tempPath, finalPath);
+      fs.unlinkSync(tempPath);
+    }
+
+    const photoUrl = `${proto}://${req.headers.host}/uploads/${prefix}/${finalName}`;
     const deviceId = req.body.deviceId;
     console.log(`收到图片: ${photoUrl}, 发送给设备: ${deviceId}`);
-    io.emit(`upload_success_${deviceId}`, { photoUrl, photoId: Math.floor(Math.random() * 10000).toString().padStart(4, '0') });
-    res.json({ success: true, url: photoUrl });
+    io.emit(`upload_success_${deviceId}`, { photoUrl, photoId: photoCode });
+    res.json({ success: true, url: photoUrl, photoId: photoCode });
   } else {
     res.status(400).json({ success: false });
   }
